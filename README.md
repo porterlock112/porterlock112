@@ -1,5 +1,6 @@
-## Hi there 👋
-
+wc -l ledger/truthlock_ledger.jsonl
+ls -1 proofs | tail -n 3
+sed -n '1,80p' claims/$(ls -1 claims | tail -n1){"url":"https://site/item","title":"…","text":"…"}cat live_feed.ndjson | python3 scripts/lock_watch.py
 <!--
 **porterlock112/porterlock112** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
 
