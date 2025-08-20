@@ -1,3 +1,469 @@
+Strict-Mode Hub Workflow with Mesh Fan-Out
+
+This patch strengthens the Hub GitHub Actions workflow by enforcing a per-repository glyph allowlist (“strict mode”), clearly logging allowed vs denied triggers, and ensuring that fan-out dispatches only occur when there are glyphs to send.  It adds a small allowlist YAML (.godkey-allowed-glyphs.yml), new environment flags, and updated steps. The result is a more robust CI pipeline that prevents unauthorized or unintended runs while providing clear visibility of what’s executed or skipped.
+
+1. Allowlist for Glyphs (Strict Mode)
+
+We introduce an allowlist file (.godkey-allowed-glyphs.yml) in each repo. This file contains a YAML list of permitted glyphs (Δ tokens) for that repository. For example:
+
+# Only these glyphs are allowed in THIS repo (hub)
+allowed:
+  - ΔSEAL_ALL
+  - ΔPIN_IPFS
+  - ΔWCI_CLASS_DEPLOY
+  # - ΔSCAN_LAUNCH
+  # - ΔFORCE_WCI
+  # - Δ135_RUN
+
+A new environment variable STRICT_GLYPHS: "true" enables strict-mode filtering. When on, only glyphs listed under allowed: in the file are executed; all others are denied. If STRICT_GLYPHS is true but no allowlist file is found, we “fail closed” by denying all glyphs.  Denied glyphs are logged but not run (unless you enable a hard failure, see section 11). This ensures only explicitly permitted triggers can run in each repo.
+
+
+2. Environment Variables and Inputs
+
+Key new vars in the workflow’s env: section:
+
+TRIGGER_TOKENS – a comma-separated list of all valid glyph tokens globally (e.g. ΔSCAN_LAUNCH,ΔSEAL_ALL,…). Incoming triggers are first filtered against this list to ignore typos or irrelevant Δ strings.
+
+STRICT_GLYPHS – set to "true" (or false) to turn on/off the per-repo allowlist.
+
+STRICT_FAIL_ON_DENY – if "true", the workflow will hard-fail when any glyph is denied under strict mode. If false, it just logs denied glyphs and continues with the rest.
+
+ALLOWLIST_FILE – path to the YAML allowlist (default .godkey-allowed-glyphs.yml).
+
+FANOUT_GLYPHS – comma-separated glyphs that should be forwarded to satellites (e.g. ΔSEAL_ALL,ΔPIN_IPFS,ΔWCI_CLASS_DEPLOY).
+
+MESH_TARGETS – CSV of repo targets for mesh dispatch (e.g. "owner1/repoA,owner2/repoB"). Can be overridden at runtime via the workflow_dispatch input mesh_targets.
+
+
+We also support these workflow_dispatch inputs:
+
+glyphs_csv – comma-separated glyphs (to manually trigger specific glyphs).
+
+rekor – "true"/"false" to enable keyless Rekor signing.
+
+mesh_targets – comma-separated repos to override MESH_TARGETS for a manual run.
+
+
+This uses GitHub’s workflow_dispatch inputs feature, so you can trigger the workflow manually with custom glyphs or mesh targets.
+
+3. Collecting and Filtering Δ Triggers
+
+The first job (scan) has a “Collect Δ triggers (strict-aware)” step (using actions/github-script). It builds a list of requested glyphs by scanning all inputs:
+
+Commit/PR messages and refs: It concatenates the push or PR title/body (and commit messages), plus the ref name.
+
+Workflow/Repo dispatch payload: It includes any glyphs_csv from a manual workflow_dispatch or a repository_dispatch’s client_payload.
+
+
+From that combined text, it extracts any tokens starting with Δ. These requested glyphs are uppercased and deduplicated.
+
+Next comes global filtering: we keep only those requested glyphs that are in TRIGGER_TOKENS. This removes any unrecognized or disabled tokens.
+
+Then, if strict mode is on, we load the allowlist (fs.readFileSync(ALLOWLIST_FILE)) and filter again: only glyphs present in the allowlist remain. Any globally-allowed glyph not in the allowlist is marked denied. (If the file is missing and strict is true, we treat allowlist as empty – effectively denying all.)
+
+The script logs the Requested, Globally allowed, Repo-allowed, and Denied glyphs to the build output. It then sets two JSON-array outputs: glyphs_json (the final allowed glyphs) and denied_json (the denied ones). For example:
+
+Requested: ΔSEAL_ALL ΔUNKNOWN
+Globally allowed: ΔSEAL_ALL
+Repo allowlist: ΔSEAL_ALL ΔWCI_CLASS_DEPLOY
+Repo-allowed: ΔSEAL_ALL
+Denied (strict): (none)
+
+This makes it easy to audit which triggers passed or failed the filtering.
+
+Finally, the step outputs glyphs_json and denied_json, and also passes through the rekor input (true/false) for later steps.
+
+4. Guarding Secrets on Forks
+
+A crucial security step is “Guard: restrict secrets on forked PRs”. GitHub Actions by default do not provide secrets to workflows triggered by public-fork pull requests. To avoid accidental use of unavailable secrets, this step checks if the PR’s head repository is a fork. If so, it sets allow_secrets=false. The run job will later skip any steps (like IPFS pinning) that require secrets. This follows GitHub’s best practice: _“with the exception of GITHUB_TOKEN, secrets are not passed to the runner when a workflow is triggered from a forked repository”_.
+
+5. Scan Job Summary
+
+After collecting triggers, the workflow adds a scan summary to the job summary UI. It echoes a Markdown section showing the JSON arrays of allowed and denied glyphs, and whether secrets are allowed:
+
+### Δ Hub — Scan
+- Allowed: ["ΔSEAL_ALL"]
+- Denied:  ["ΔSCAN_LAUNCH","ΔPIN_IPFS"]
+- Rekor:   true
+- Secrets OK on this event?  true
+
+Using echo ... >> $GITHUB_STEP_SUMMARY, these lines become part of the GitHub Actions run summary. This gives immediate visibility into what the scan found (the summary supports GitHub-flavored Markdown and makes it easy to read key info).
+
+If STRICT_FAIL_ON_DENY is true and any glyph was denied, the scan job then fails with an error. Otherwise it proceeds, but denied glyphs will simply be skipped in the run.
+
+6. Executing Allowed Glyphs (Run Job)
+
+The next job (run) executes each allowed glyph in parallel via a matrix. It is gated on:
+
+if: needs.scan.outputs.glyphs_json != '[]' && needs.scan.outputs.glyphs_json != ''
+
+This condition (comparing the JSON string to '[]') skips the job entirely if no glyphs passed filtering. GitHub’s expression syntax allows checking emptiness this way (as seen in the docs, if: needs.changes.outputs.packages != '[]' is a common pattern).
+
+Inside each glyph job:
+
+The workflow checks out the code and sets up Python 3.11.
+
+It installs dependencies if requirements.txt exists.
+
+The key step is a Bash case "${GLYPH}" in ... esac that runs the corresponding Python script for each glyph:
+
+ΔSCAN_LAUNCH: Runs python truthlock/scripts/ΔSCAN_LAUNCH.py --execute ... to perform a scan.
+
+ΔSEAL_ALL: Runs python truthlock/scripts/ΔSEAL_ALL.py ... to seal all data.
+
+ΔPIN_IPFS: If secrets are allowed (not a fork), it runs python truthlock/scripts/ΔPIN_IPFS.py --pinata-jwt ... to pin output files to IPFS. If secrets are not allowed, this step is skipped.
+
+ΔWCI_CLASS_DEPLOY: Runs the corresponding deployment script.
+
+ΔFORCE_WCI: Runs a force trigger script.
+
+Δ135_RUN (alias Δ135): Runs a script to execute webchain ID 135 tasks (with pinning and Rekor).
+
+*): Unknown glyph – fails with an error.
+
+
+
+Each glyph’s script typically reads from truthlock/out (the output directory) and writes reports into truthlock/out/ΔLEDGER/.  By isolating each glyph in its own job, we get parallelism and fail-fast (one glyph error won’t stop others due to strategy.fail-fast: false).
+
+7. Optional Rekor Sealing
+
+After each glyph script, there’s an “Optional Rekor seal” step. If the rekor flag is "true", it looks for the latest report JSON in truthlock/out/ΔLEDGER and would (if enabled) call a keyless Rekor sealing script (commented out in the snippet). This shows where you could add verifiable log signing. The design passes along the rekor preference from the initial scan (which defaults to true) into each job, so signing can be toggled per run.
+
+8. Uploading Artifacts & ΔSUMMARY
+
+Once a glyph job completes, it always uploads its outputs with actions/upload-artifact@v4. The path includes everything under truthlock/out, excluding any .tmp files:
+
+- uses: actions/upload-artifact@v4
+  with:
+    name: glyph-${{ matrix.glyph }}-artifacts
+    path: |
+      truthlock/out/**
+      !**/*.tmp
+
+GitHub’s upload-artifact supports multi-line paths and exclusion patterns, as shown in their docs (e.g. you can list directories and use !**/*.tmp to exclude temp files).
+
+After uploading, the workflow runs python scripts/glyph_summary.py (provided by the project) to aggregate results and writes ΔSUMMARY.md.  Then it appends this ΔSUMMARY into the job’s GitHub Actions summary (again via $GITHUB_STEP_SUMMARY) so that the content of the summary file is visible in the run UI under this step. This leverages GitHub’s job summary feature to include custom Markdown in the summary.
+
+9. Mesh Fan-Out Job
+
+If secrets are allowed and there are glyphs left after strict filtering, the “Mesh fan-out” job will dispatch events to satellite repos. Its steps:
+
+1. Compute fan-out glyphs: It reads the allowed glyphs JSON from needs.scan.outputs.glyphs_json and intersects it with the FANOUT_GLYPHS list. In effect, only certain glyphs (like ΔSEAL_ALL, ΔPIN_IPFS, ΔWCI_CLASS_DEPLOY) should be propagated. The result is output as fanout_csv. If the list is empty, the job will early-skip dispatch.
+
+
+2. Build target list: It constructs the list of repositories to dispatch to. It first checks if a mesh_targets input was provided (from manual run); if not, it uses the MESH_TARGETS env var. It splits the CSV into an array of owner/repo strings. This allows dynamic override of targets at run time.
+
+
+3. Skip if nothing to do: If there are no fan-out glyphs or no targets, it echoes a message and stops.
+
+
+4. Dispatch to mesh targets: Using another actions/github-script step (with Octokit), it loops over each target repo and sends a repository_dispatch POST request:
+
+await octo.request("POST /repos/{owner}/{repo}/dispatches", {
+  owner, repo,
+  event_type: (process.env.MESH_EVENT_TYPE || "glyph"),
+  client_payload: {
+    glyphs_csv: glyphs, 
+    rekor: rekorFlag,
+    from: `${context.repo.owner}/${context.repo.repo}@${context.ref}`
+  }
+});
+
+This uses GitHub’s Repository Dispatch event to trigger the glyph workflow in each satellite. Any client_payload fields (like our glyphs_csv and rekor) will be available in the satellite workflows as github.event.client_payload. (GitHub docs note that data sent via client_payload can be accessed in the triggered workflow’s github.event.client_payload context.) We also pass along the original ref in from for traceability. Dispatch success or failures are counted and logged per repo.
+
+
+5. Mesh summary: Finally it adds a summary of how many targets were reached and how many dispatches succeeded/failed, again to the job summary.
+
+
+
+This way, only glyphs that survived strict filtering and are designated for mesh fan-out are forwarded, and only when there are targets. Fan-out will not send any disallowed glyphs, preserving the strict policy.
+
+10. Mesh Fan-Out Summary
+
+At the end of the fan-out job, the workflow prints a summary with target repos and glyphs dispatched:
+
+### 🔗 Mesh Fan-out
+- Targets: `["owner1/repoA","owner2/repoB"]`
+- Glyphs:  `ΔSEAL_ALL,ΔPIN_IPFS`
+- OK:      2
+- Failed:  0
+
+This confirms which repos were contacted and the glyph list (useful for auditing distributed dispatches).
+
+11. Configuration and Usage
+
+Enable/disable strict mode: Set STRICT_GLYPHS: "true" or "false" in env:. If you want the workflow to fail when any glyph is denied, set STRICT_FAIL_ON_DENY: "true". (If false, it will just log denied glyphs and continue with allowed ones.)
+
+Override mesh targets at runtime: When manually triggering (via “Actions → Run workflow”), you can provide a mesh_targets string input (CSV of owner/repo). If given, it overrides MESH_TARGETS.
+
+Turning off Rekor: Use the rekor input (true/false) on a dispatch to disable keyless signing.
+
+Companion files: Alongside this workflow, keep the .godkey-allowed-glyphs.yml (with your repo’s allowlist). Also ensure scripts/emit_glyph.py (to send dispatches) and scripts/glyph_summary.py (to generate summaries) are present as provided by the toolkit.
+
+Example one-liners:
+
+Soft strict mode (log & skip denied):
+
+env:
+  STRICT_GLYPHS: "true"
+  STRICT_FAIL_ON_DENY: "false"
+
+Hard strict mode (fail on any deny):
+
+env:
+  STRICT_GLYPHS: "true"
+  STRICT_FAIL_ON_DENY: "true"
+
+Override mesh targets when running workflow: In the GitHub UI, under Run workflow, set mesh_targets="owner1/repoA,owner2/repoB".
+
+Trigger a mesh-based deploy: One can call python scripts/emit_glyph.py ΔSEAL_ALL "mesh deploy" to send ΔSEAL_ALL to all configured targets.
+
+
+
+By following these steps, the Hub workflow now strictly enforces which Δ glyphs run and propagates only approved tasks to satellites. This “pure robustness” approach ensures unauthorized triggers are filtered out (and clearly reported), secrets aren’t misused on forks, and fan-out only happens when safe.
+
+Sources: GitHub Actions concurrency and dispatch behavior is documented on docs.github.com.  Checking JSON outputs against '[]' to skip jobs is a known pattern.  Workflow_dispatch inputs and job summaries are handled per the official syntax.  The upload-artifact action supports multiple paths and exclusions as shown, and GitHub Actions’ security model intentionally blocks secrets on fork PRs. All logging and filtering logic here builds on those mechanisms.
+
+Boom. Here’s the satellite receiver you can drop into any downstream repo. It listens for repository_dispatch events (type: glyph) and immediately runs the requested Δ-glyphs with the same safety rails. It also supports manual workflow_dispatch for testing.
+
+.github/workflows/glyph-receiver.yml
+
+name: Δ Glyph Receiver
+
+on:
+  repository_dispatch:
+    types: [glyph]
+  workflow_dispatch:
+    inputs:
+      glyphs_csv:
+        description: "Comma-separated glyphs to run (e.g. ΔSEAL_ALL,ΔPIN_IPFS)"
+        required: true
+      rekor:
+        description: "Enable Rekor sealing"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
+  actions: read
+  id-token: write        # for keyless Rekor/cosign if you enable it
+  attestations: write
+
+env:
+  # Allowed glyphs for this repo/node (tighten per repo if needed)
+  TRIGGER_TOKENS: "ΔSCAN_LAUNCH,ΔSEAL_ALL,ΔPIN_IPFS,ΔWCI_CLASS_DEPLOY,ΔFORCE_WCI,Δ135_RUN"
+  PYTHONUTF8: "1"
+
+jobs:
+  parse:
+    name: Parse incoming glyphs
+    runs-on: ubuntu-latest
+    outputs:
+      glyphs_json: ${{ steps.collect.outputs.glyphs_json }}
+      rekor: ${{ steps.collect.outputs.rekor }}
+      emitter: ${{ steps.collect.outputs.emitter }}
+      from_ref: ${{ steps.collect.outputs.from_ref }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Collect requested Δ glyphs
+        id: collect
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tokens = (process.env.TRIGGER_TOKENS || '').split(',').map(s=>s.trim().toUpperCase()).filter(Boolean);
+
+            // Accept from repository_dispatch or workflow_dispatch
+            let csv = "";
+            let rekor = "true";
+            let emitter = "receiver";
+            let from_ref = "";
+
+            if (context.eventName === "repository_dispatch") {
+              const p = context.payload?.client_payload || {};
+              csv     = (p.glyphs_csv || "").trim();
+              rekor   = String(p.rekor ?? "true");
+              emitter = p.from || "upstream";
+              from_ref= context.payload?.client_payload?.from || "";
+            } else if (context.eventName === "workflow_dispatch") {
+              csv   = (context.payload?.inputs?.glyphs_csv || "").trim();
+              rekor = String(context.payload?.inputs?.rekor ?? "true");
+              emitter = "manual";
+            }
+
+            const requested = csv
+              .split(/[,\s]+/)
+              .map(s=>s.trim())
+              .filter(Boolean);
+
+            // Filter: only allow configured tokens
+            const allowed = requested
+              .filter(g => tokens.includes(g.toUpperCase()));
+
+            core.info(`Requested glyphs: ${requested.join(" ") || "(none)"}`);
+            core.info(`Allowed glyphs:   ${allowed.join(" ") || "(none)"}`);
+
+            core.setOutput('glyphs_json', JSON.stringify(Array.from(new Set(allowed))));
+            core.setOutput('rekor', rekor);
+            core.setOutput('emitter', emitter);
+            core.setOutput('from_ref', from_ref);
+
+      - name: Summary
+        run: |
+          echo "### Δ Receiver — Parse" >> $GITHUB_STEP_SUMMARY
+          echo "- Emitter: ${{ steps.collect.outputs.emitter }}" >> $GITHUB_STEP_SUMMARY
+          echo "- From:    ${{ steps.collect.outputs.from_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Glyphs:  ${{ steps.collect.outputs.glyphs_json }}" >> $GITHUB_STEP_SUMMARY
+
+  run:
+    name: Execute Δ glyphs (receiver)
+    needs: [parse]
+    if: ${{ needs.parse.outputs.glyphs_json != '[]' && needs.parse.outputs.glyphs_json != '' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        glyph: ${{ fromJSON(needs.parse.outputs.glyphs_json) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Python setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run glyph
+        id: exec
+        env:
+          GLYPH: ${{ matrix.glyph }}
+          # These secrets are local to each receiver repo (safe-by-default)
+          PINATA_JWT: ${{ secrets.PINATA_JWT }}
+          REKOR_ENABLE: ${{ needs.parse.outputs.rekor }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Receiver running glyph: ${GLYPH}"
+
+          case "${GLYPH}" in
+            "ΔSCAN_LAUNCH")
+              python truthlock/scripts/ΔSCAN_LAUNCH.py --execute --report truthlock/out/ΔSCAN_REPORT.json
+              ;;
+            "ΔSEAL_ALL")
+              python truthlock/scripts/ΔSEAL_ALL.py --input truthlock/out --out truthlock/out/ΔLEDGER/ΔSEAL_ALL_REPORT.json
+              ;;
+            "ΔPIN_IPFS")
+              PIN_FLAG=""
+              if [ -n "${PINATA_JWT:-}" ]; then PIN_FLAG="--pinata-jwt '${PINATA_JWT}'"; fi
+              python truthlock/scripts/ΔPIN_IPFS.py --dir truthlock/out --ledger truthlock/out/ΔLEDGER ${PIN_FLAG}
+              ;;
+            "ΔWCI_CLASS_DEPLOY")
+              python truthlock/scripts/ΔWCI_CLASS_DEPLOY.py --manifest truthlock/out/ΔWCI_CLASS_MANIFEST.json --out truthlock/out/ΔLEDGER
+              ;;
+            "ΔFORCE_WCI")
+              python truthlock/scripts/ΔFORCE_WCI.py --run --out truthlock/out/ΔLEDGER/ΔFORCE_WCI_REPORT.json
+              ;;
+            "Δ135_RUN"|"Δ135")
+              python truthlock/scripts/Δ135_TRIGGER.py --execute --resolve-missing --pin --rekor --max-bytes 10485760 \
+                --allow "truthlock/out/ΔLEDGER/*.json"
+              ;;
+            *)
+              echo "Unknown glyph at receiver: ${GLYPH}" >&2
+              exit 2
+              ;;
+          esac
+
+      - name: Optional Rekor seal (keyless)
+        if: ${{ needs.parse.outputs.rekor == 'true' }}
+        run: |
+          set -euo pipefail
+          REPORT=$(ls -1t truthlock/out/ΔLEDGER/*${GLYPH#Δ}*_REPORT.json 2>/dev/null | head -n1 || true)
+          if [ -n "${REPORT}" ]; then
+            echo "Receiver Rekor seal → ${REPORT}"
+            # Call your local rekor client script or cosign attest here, if configured.
+            # python truthlock/scripts/rekor_seal.py --file "${REPORT}" --out "truthlock/out/rekor_proof_${GLYPH#Δ}.json"
+          else
+            echo "No report found to seal for ${GLYPH}"
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: receiver-${{ matrix.glyph }}-artifacts
+          path: |
+            truthlock/out/**
+            !**/*.tmp
+
+      - name: Append per-glyph summary
+        if: always()
+        run: |
+          echo "### ✅ Receiver executed: ${{ matrix.glyph }}" >> $GITHUB_STEP_SUMMARY
+
+  summarize:
+    name: ΔSUMMARY (receiver)
+    needs: [run]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Generate ΔSUMMARY.md
+        run: |
+          python scripts/glyph_summary.py
+        env:
+          SUMMARY_COMMIT: "false"
+          SUMMARY_PATH: "ΔSUMMARY.md"
+          LEDGER_DIR: "truthlock/out/ΔLEDGER"
+          GIT_USER_NAME: "GodKey Bot"
+          GIT_USER_EMAIL: "bot@godkey.local"
+      - name: Append summary to job summary
+        run: |
+          echo "## ΔSUMMARY.md (receiver)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cat ΔSUMMARY.md >> $GITHUB_STEP_SUMMARY
+
+How to use it
+
+1. Add this file to each satellite repo that should respond to your main repo’s fan-out.
+
+
+2. (Optional) Put the same scripts/ you use in the main node (or tailor per-repo).
+At minimum, each receiver must have the scripts it will execute (e.g., ΔSEAL_ALL.py, ΔPIN_IPFS.py, etc.).
+
+
+3. If receivers will pin to IPFS, add a repo secret PINATA_JWT (or adapt the step to your pinning method).
+
+
+4. Test locally on a receiver with:
+
+
+
+Actions → Run workflow → glyph-receiver.yml
+glyphs_csv = ΔSEAL_ALL,ΔPIN_IPFS
+rekor = true
+
+5. From the main hub repo, trigger a mesh run (using your helper):
+
+
+
+python scripts/emit_glyph.py ΔSEAL_ALL "mesh deploy"
+
+…and your hub’s fanout job will dispatch to all receivers, which will immediately execute the same glyphs.
+
+
+---
+
+Want a “strict mode” patch that rejects any glyph not explicitly whitelisted per-repo (with a nice error in the summary), and an allowlist per repo via a YAML (e.g., .godkey-allowed-glyphs.yml)? I can add that guardrail in ~15 lines so satellites can opt into tighter scopes.
+
 ΔCASE_BUILDER_TX: Texas Case Pack Kit Overview
 
 The ΔCASE_BUILDER_TX kit is a customizable, spreadsheet-based toolkit for building and managing legal case files in Texas, especially for local disputes (“around-town” matters) and family law cases. It’s not legal advice – rather, it provides a structured “scaffold” to track facts, evidence, witnesses, and legal theories over time, helping you stay organized and clear on what needs to be proven in each claim.  The kit uses linked templates (CSV files and Markdown drafts) so that events, documents, and claims are all cross-referenced. For example, timeline entries reference evidence IDs, and legal-claim matrices tie facts to specific legal elements. This approach mirrors best practices in litigation preparation, where each fact and piece of evidence is linked to the issues it supports. As facts or documents emerge (e.g. via public records requests), you update the timeline and evidence logs, which in turn refines your legal strategy and drafting.
